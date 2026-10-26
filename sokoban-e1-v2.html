@@ -18,7 +18,7 @@
 </style>
 </head>
 <body>
-<div id="hud"><span>Moves <b id="moves">0</b></span><span>Pushes <b id="pushes">0</b></span></div>
+<div id="hud"><span>Moves <b id="moves">0</b></span><span>Pushes <b id="pushes">0</b></span><span>Level <b id="level">-</b></span></div>
 <canvas id="game" width="360" height="360"></canvas>
 <div id="msg">arrow keys / WASD to move — push all boxes onto goals ( / )</div>
 <div id="keys">R restarts — N next level (when solved)</div>
@@ -66,6 +66,7 @@ function sync() {
   const done = boxes.length > 0 && boxes.every(onGoal);
   $("msg").innerHTML = done ? '<span id="solved">SOLVED — all boxes on goals</span>'
     : "arrow keys / WASD to move — push all boxes onto goals ( / )";
+  $("level").textContent = lv.name; // E-006: visible level name (HUD) — render/stub-observable level identity
 }
 function draw() {
   for (let y = 0; y < lv.height; y++) {
