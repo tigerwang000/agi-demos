@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minesweeper</title>
+<style>
+  html,body{margin:0;padding:0;background:#111;color:#eee;font-family:monospace;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+  #hud{display:flex;gap:24px;font-size:18px}
+  canvas{border:2px solid #444;background:#282838}
+  #msg{font-size:14px;color:#888;min-height:18px}
+  button{background:#222;color:#eee;border:1px solid #555;padding:6px 16px;font-family:monospace;font-size:14px;cursor:pointer}
+  button:hover{background:#333}
+</style>
+</head>
+<body>
+<div id="hud"><span id="mines">Mines: 10</span><span id="flags">Flags: 0</span><span id="revealed">Revealed: 0</span><span id="time">Time: 0s</span><span id="difficulty">easy</span><span id="best">Best: 0</span></div>
+<canvas id="game" width="270" height="270"></canvas>
+<div id="msg">Enter reveal · F flag · Arrows move</div>
+<button id="restart">Restart</button>
+<script>
+"use strict";
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const minesEl = document.getElementById("mines");
+const flagsEl = document.getElementById("flags");
+const revealedEl = document.getElementById("revealed");
+const timeEl = document.getElementById("time");
+const difficultyEl = document.getElementById("difficulty");
+const bestEl = document.getElementById("best");
+const msgEl = document.getElementById("msg");
+const restartBtn = document.getElementById("restart");
+
+// Difficulty presets (E-007 C1, v2): ?d= easy|medium|hard. Additive — the
+// per-field ?w/?h/?m/?s/?fx/?fy params still override the preset when both
+// are given (explicit > preset > default). RNG/seed logic untouched.
+const PRESETS = {
+  easy:   { width: 9,  height: 9,  mines: 10 },
+  medium: { width: 12, height: 12, mines: 22 },
+  hard:   { width: 16, height: 16, mines: 40 },
+};
+
+// Board config. Default = "First Steps" (E-007 board b1). Overridable via
+// query string (?w=9&h=9&m=10&s=20261027&fx=4&fy=4) so every validated board
+// spec in harness/boards/ is playable by URL — content is data, engine is code.
+const CFG = { width: 9, height: 9, mines: 10, seed: 20261027, first: { x: 4, y: 4 } };
+let DIFFICULTY = "easy";
+(function fromQuery(qs) {
+  if (!qs) return;
+  const q = new URLSearchParams(qs);
+  const num = (k, lo, hi, dflt) => { const raw = q.get(k); if (raw === null) return dflt; const v = Number(raw); return Number.isInteger(v) && v >= lo && v <= hi ? v : dflt; };
+  const preset = PRESETS[q.get("d")];
+  if (preset) { // preset first, explicit fields can still override
+    DIFFICULTY = q.get("d");
+    CFG.width = preset.width; CFG.height = preset.height; CFG.mines = preset.mines;
+    CFG.first = { x: Math.floor(preset.width / 2), y: Math.floor(preset.height / 2) };
+  }
+  CFG.width = num("w", 6, 16, CFG.width);
+  CFG.height = num("h", 6, 16, CFG.height);
+  CFG.mines = num("m", 3, 40, CFG.mines);
+  CFG.mines = Math.min(CFG.mines, CFG.width * CFG.height - 9);
+  CFG.seed = num("s", 1, 2147483647, CFG.seed);
+  CFG.first = { x: num("fx", 0, CFG.width - 1, Math.floor(CFG.width / 2)),
+                y: num("fy", 0, CFG.height - 1, Math.floor(CFG.height / 2)) };
+})(typeof location !== "undefined" && location ? location.search : "");
+
+const CELL = 30;
+const W = CFG.width * CELL, H = CFG.height * CELL;
+canvas.width = W; canvas.height = H;
+
+const STATE = { READY: 0, RUN: 1, OVER: 2, WIN: 3 };
+
+// Deterministic run-to-run: seeded LCG instead of Math.random(), so acceptance
+// tests replay exact boards (same seed = same layout every run). This mirrors
+// E-007 harness/level.mjs layout() line for line — the validator IS the spec.
+let rngState;
+function rng() {
+  rngState = (rngState * 1103515245 + 12345) & 0x7fffffff;
+  return rngState / 0x7fffffff;
+}
+
+let state, revealed, flagged, mineSet, numbers, started, cursor, best = 0;
+// Elapsed run time (E-007 C2, v2): frames-driven, not wall-clock — 60 frames
+// = 1s so the stub harness can advance time deterministically via `frames`.
+// READY = 0 and frozen; RUN accumulates; OVER/WIN frozen (post-run display);
+// reset() returns it to 0.
+let elapsedFrames = 0;
+let timeSecs = 0;
+const FRAMES_PER_SEC = 60;
+
+// Observability contract: HUD counters (#mines/#flags/#revealed/#time/
+// #difficulty/#best) and msg are all textContent; window.__ms exposes
+// structured state for probes. Observability fields shipped WITH the first
+// behavior dimension, not after (E-006 #21 lesson applied at design time —
+// C2's timer dimension and C1's preset field follow the same discipline).
+function syncHud() {
+  let f = 0, r = 0;
+  for (const x of flagged) if (x) f++;
+  for (const x of revealed) if (x) r++;
+  flagsEl.textContent = "Flags: " + f;
+  revealedEl.textContent = "Revealed: " + r;
+  timeEl.textContent = "Time: " + timeSecs + "s";
+  difficultyEl.textContent = DIFFICULTY;
+}
+function expose() {
+  window.__ms = {
+    state, width: CFG.width, height: CFG.height,
+    revealedCount: revealed.reduce((a, b) => a + (b ? 1 : 0), 0),
+    flaggedCount: flagged.reduce((a, b) => a + (b ? 1 : 0), 0),
+    timeSecs, difficulty: DIFFICULTY,
+  };
+}
+
+function buildBoard(firstClick) {
+  rngState = CFG.seed >>> 0;
+  const banned = new Set();
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const x = firstClick.x + dx, y = firstClick.y + dy;
+    if (x >= 0 && x < CFG.width && y >= 0 && y < CFG.height) banned.add(y * CFG.width + x);
+  }
+  const candidates = [];
+  for (let i = 0; i < CFG.width * CFG.height; i++) if (!banned.has(i)) candidates.push(i);
+  const n = CFG.mines;
+  for (let i = 0; i < n; i++) {
+    const j = i + Math.floor(rng() * (candidates.length - i));
+    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+  }
+  mineSet = new Set(candidates.slice(0, n));
+  numbers = [];
+  for (let y = 0; y < CFG.height; y++) for (let x = 0; x < CFG.width; x++) {
+    if (mineSet.has(y * CFG.width + x)) { numbers.push(-1); continue; }
+    let c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue;
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && nx < CFG.width && ny >= 0 && ny < CFG.height && mineSet.has(ny * CFG.width + nx)) c++;
+    }
+    numbers.push(c);
+  }
+}
+
+function reset() {
+  state = STATE.READY;
+  revealed = new Array(CFG.width * CFG.height).fill(false);
+  flagged = new Array(CFG.width * CFG.height).fill(false);
+  numbers = new Array(CFG.width * CFG.height).fill(0);
+  mineSet = new Set();
+  started = false;
+  cursor = { x: CFG.first.x, y: CFG.first.y };
+  elapsedFrames = 0;
+  timeSecs = 0;
+  minesEl.textContent = "Mines: " + CFG.mines;
+  msgEl.textContent = "Enter reveal · F flag · Arrows move";
+  syncHud(); expose();
+}
+
+function reveal(i) {
+  if (state !== STATE.READY && state !== STATE.RUN) return;
+  if (revealed[i] || flagged[i]) return;
+  if (!started) {
+    buildBoard({ x: i % CFG.width, y: (i / CFG.width) | 0 });
+    started = true; state = STATE.RUN; msgEl.textContent = "";
+  }
+  if (mineSet.has(i)) return gameOver();
+  const q = [i];
+  while (q.length) {
+    const j = q.shift();
+    if (revealed[j] || flagged[j] || mineSet.has(j)) continue;
+    revealed[j] = true;
+    if (numbers[j] === 0) {
+      const x = j % CFG.width, y = (j / CFG.width) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && nx < CFG.width && ny >= 0 && ny < CFG.height) q.push(ny * CFG.width + nx);
+      }
+    }
+  }
+  checkWin(); syncHud(); expose();
+}
+
+function flag(i) {
+  if (state !== STATE.READY && state !== STATE.RUN) return;
+  if (revealed[i]) return;
+  flagged[i] = !flagged[i];
+  syncHud(); expose();
+}
+
+function gameOver() {
+  state = STATE.OVER;
+  for (const m of mineSet) revealed[m] = true;
+  msgEl.textContent = "Game over! — Space or button to restart";
+  syncHud(); expose();
+}
+
+function checkWin() {
+  let hidden = 0;
+  for (let i = 0; i < revealed.length; i++) if (!revealed[i]) hidden++;
+  if (hidden === CFG.mines) {
+    state = STATE.WIN;
+    for (let k = 0; k < flagged.length; k++) if (mineSet.has(k)) flagged[k] = true;
+    best = best + 1;
+    localStorage.setItem("ms_best", String(best));
+    bestEl.textContent = "Best: " + best;
+    msgEl.textContent = "You win! Board cleared — Space or button to restart";
+  }
+}
+
+function draw() {
+  ctx.fillStyle = "#282838";
+  ctx.fillRect(0, 0, W, H);
+  const COLORS = ["#7d7", "#6af", "#e55", "#d94", "#c5c", "#e9a", "#9dd", "#ddd", "#999"];
+  for (let y = 0; y < CFG.height; y++) for (let x = 0; x < CFG.width; x++) {
+    const i = y * CFG.width + x;
+    const px = x * CELL, py = y * CELL;
+    if (revealed[i]) {
+      ctx.fillStyle = "#3a3a4a";
+      ctx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+      if (mineSet.has(i)) {
+        ctx.fillStyle = "#e33";
+        ctx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+        ctx.fillStyle = "#111";
+        ctx.beginPath();
+        ctx.arc(px + CELL / 2, py + CELL / 2, 5, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (numbers[i] > 0) {
+        ctx.fillStyle = COLORS[numbers[i] - 1] || "#fff";
+        ctx.font = "bold 16px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(numbers[i]), px + CELL / 2, py + CELL / 2 + 1);
+      }
+    } else {
+      ctx.fillStyle = "#4a4a5e";
+      ctx.fillRect(px + 1, py + 1, CELL - 2, CELL - 2);
+      if (flagged[i]) {
+        ctx.fillStyle = "#e55";
+        ctx.beginPath();
+        ctx.moveTo(px + 8, py + 6);
+        ctx.lineTo(px + 22, py + 15);
+        ctx.lineTo(px + 8, py + 24);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  }
+  // cursor highlight
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cursor.x * CELL + 1, cursor.y * CELL + 1, CELL - 2, CELL - 2);
+  if (state === STATE.OVER || state === STATE.WIN) {
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff";
+    ctx.font = "28px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(state === STATE.OVER ? "GAME OVER" : "CLEARED", W / 2, H / 2 - 8);
+  }
+}
+
+function cellAt(px, py) {
+  const x = Math.floor(px / CELL), y = Math.floor(py / CELL);
+  if (x < 0 || x >= CFG.width || y < 0 || y >= CFG.height) return null;
+  return { x, y };
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === " ") e.preventDefault();
+  if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    if (e.key === "ArrowUp" && cursor.y > 0) cursor.y--;
+    if (e.key === "ArrowDown" && cursor.y < CFG.height - 1) cursor.y++;
+    if (e.key === "ArrowLeft" && cursor.x > 0) cursor.x--;
+    if (e.key === "ArrowRight" && cursor.x < CFG.width - 1) cursor.x++;
+    return;
+  }
+  if (e.key === "Enter") { reveal(cursor.y * CFG.width + cursor.x); return; }
+  if (e.key === " ") { if (state === STATE.OVER || state === STATE.WIN) reset(); return; }
+  if (e.key === "f" || e.key === "F") { flag(cursor.y * CFG.width + cursor.x); return; }
+});
+
+canvas.addEventListener("click", (e) => {
+  const r = canvas.getBoundingClientRect();
+  const c = cellAt(e.clientX - r.left, e.clientY - r.top);
+  if (c) reveal(c.y * CFG.width + c.x);
+});
+canvas.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const c = cellAt(e.clientX - r.left, e.clientY - r.top);
+  if (c) flag(c.y * CFG.width + c.x);
+});
+restartBtn.addEventListener("click", () => reset());
+
+best = Number(localStorage.getItem("ms_best") || 0);
+bestEl.textContent = "Best: " + best;
+reset();
+draw();
+requestAnimationFrame(function loop() {
+  // timer advance: only while running, 60 frames = 1s (stub harness drives
+  // frames; real browser rAF is ~60fps so both see the same contract)
+  if (state === STATE.RUN) {
+    elapsedFrames++;
+    const secs = Math.floor(elapsedFrames / FRAMES_PER_SEC);
+    if (secs !== timeSecs) { timeSecs = secs; timeEl.textContent = "Time: " + timeSecs + "s"; expose(); }
+  }
+  draw(); requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
