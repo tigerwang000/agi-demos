@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flappy</title>
+<style>
+  html,body{margin:0;padding:0;background:#111;color:#eee;font-family:monospace;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+  #hud{display:flex;gap:24px;font-size:18px}
+  canvas{border:2px solid #444;background:#282838}
+  #msg{font-size:14px;color:#888;min-height:18px}
+  button{background:#222;color:#eee;border:1px solid #555;padding:6px 16px;font-family:monospace;font-size:14px;cursor:pointer}
+  button:hover{background:#333}
+</style>
+</head>
+<body>
+<div id="hud"><span id="score">Score: 0</span><span id="best">Best: 0</span></div>
+<canvas id="game" width="480" height="360"></canvas>
+<div id="msg">Space / ArrowUp to flap</div>
+<button id="restart">Restart</button>
+<script>
+"use strict";
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const scoreEl = document.getElementById("score");
+const bestEl = document.getElementById("best");
+const msgEl = document.getElementById("msg");
+const restartBtn = document.getElementById("restart");
+
+const W = canvas.width, H = canvas.height;
+const G = 0.25;               // gravity px/frame^2
+const FLAP = -4.5;            // flap impulse px/frame
+const SPEED = 2;              // scroll speed px/frame
+const BIRD_X = 120, BIRD_R = 12;
+const PIPE_W = 52, PIPE_GAP = 150, PIPE_SPACING = 220;
+const TICK_MS = 1000 / 60;    // fixed-step accumulator
+
+const STATE = { READY: 0, RUN: 1, OVER: 2 };
+
+// Deterministic run-to-run: seeded LCG instead of Math.random(), so acceptance
+// tests can replay exact flights (same seed = same pipe layout every run).
+let rngState = 20261027;
+function rng() {
+  rngState = (rngState * 1103515245 + 12345) & 0x7fffffff;
+  return rngState / 0x7fffffff;
+}
+
+let bird, pipes, score, best, state, acc, last;
+
+best = Number(localStorage.getItem("flappy_best") || 0);
+bestEl.textContent = "Best: " + best;
+
+function reset() {
+  rngState = 20261027;
+  bird = { y: H / 2, vy: 0 };
+  pipes = [];
+  score = 0;
+  acc = 0;
+  last = 0;
+  state = STATE.READY;
+  scoreEl.textContent = "Score: " + score;
+  msgEl.textContent = "Space / ArrowUp to flap";
+}
+
+function spawnPipe(x) {
+  const margin = 40;
+  const gapY = margin + rng() * (H - PIPE_GAP - 2 * margin);
+  pipes.push({ x, gapY });
+}
+
+function flap() {
+  if (state === STATE.OVER) return;
+  bird.vy = FLAP;
+  if (state === STATE.READY) {
+    state = STATE.RUN;
+    msgEl.textContent = "";
+    spawnPipe(W + 40);
+  }
+}
+
+function step() {
+  bird.vy += G;
+  bird.y += bird.vy;
+  for (const p of pipes) p.x -= SPEED;
+  if (pipes.length && pipes[0].x + PIPE_W < 0) pipes.shift();
+  const lastP = pipes[pipes.length - 1];
+  if (!lastP || lastP.x < W - PIPE_SPACING) spawnPipe(W);
+  for (const p of pipes) {
+    if (p.x + PIPE_W >= BIRD_X - BIRD_R && p.x <= BIRD_X + BIRD_R) {
+      if (bird.y - BIRD_R < p.gapY || bird.y + BIRD_R > p.gapY + PIPE_GAP) return gameOver();
+    }
+    if (!p.passed && p.x + PIPE_W < BIRD_X - BIRD_R) {
+      p.passed = true;
+      score++;
+      scoreEl.textContent = "Score: " + score;
+    }
+  }
+  if (bird.y + BIRD_R > H || bird.y - BIRD_R < 0) return gameOver();
+}
+
+function gameOver() {
+  state = STATE.OVER;
+  if (score > best) {
+    best = score;
+    localStorage.setItem("flappy_best", String(best));
+    bestEl.textContent = "Best: " + best;
+  }
+  msgEl.textContent = "Game over! Score " + score + " — Space or button to restart";
+}
+
+function draw() {
+  ctx.fillStyle = "#282838";
+  ctx.fillRect(0, 0, W, H);
+  for (const p of pipes) {
+    ctx.fillStyle = "#4a4";
+    ctx.fillRect(p.x, 0, PIPE_W, p.gapY);
+    ctx.fillRect(p.x, p.gapY + PIPE_GAP, PIPE_W, H - p.gapY - PIPE_GAP);
+  }
+  ctx.fillStyle = "#ee5";
+  ctx.beginPath();
+  ctx.arc(BIRD_X, bird.y, BIRD_R, 0, Math.PI * 2);
+  ctx.fill();
+  if (state === STATE.OVER) {
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff";
+    ctx.font = "28px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("GAME OVER", W / 2, H / 2 - 8);
+  }
+}
+
+function loop(t) {
+  if (!last) last = t;
+  acc += t - last;
+  last = t;
+  while (acc >= TICK_MS) {
+    if (state === STATE.RUN) step();
+    acc -= TICK_MS;
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === " " || e.key === "ArrowUp" || e.key === "ArrowDown") e.preventDefault();
+  if (e.key === " " || e.key === "ArrowUp") {
+    if (state === STATE.OVER) reset();
+    else flap();
+  }
+});
+restartBtn.addEventListener("click", () => { if (state === STATE.OVER) reset(); });
+
+reset();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
